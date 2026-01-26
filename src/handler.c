@@ -1,4 +1,7 @@
 #include <stdint.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <string.h>
 
 // UINTR栈帧结构（必须与内核一致）
 struct UintrFrame {
@@ -14,24 +17,41 @@ struct UintrFrame {
 // 全局状态 - 使用两个文件描述符
 volatile unsigned long uintr_received[2] = {0, 0};
 
+// 声明Rust回调函数
+extern void rust_interrupt_callback(const char *handler_name, unsigned long long vector);
+
+// 辅助函数：使用write系统调用打印
+static void print_interrupt(const char *prefix, unsigned long long vector) {
+    char buffer[128];
+    int len = snprintf(buffer, sizeof(buffer), "%s: Received interrupt, vector=%llu\n", prefix, vector);
+    ssize_t result = write(STDOUT_FILENO, buffer, len);
+    (void)result;
+}
+
 // 服务器中断处理程序
 void __attribute__ ((interrupt))
      __attribute__((target("general-regs-only", "inline-all-stringops")))
-     server_ui_handler(struct UintrFrame *ui_frame,
-	 	 unsigned long long vector) {
+     server_ui_handler(struct UintrFrame *_ui_frame __attribute__((unused)),
+	 unsigned long long vector) {
 
-	 	 // The vector number is same as the token
-	 	 uintr_received[vector] = 1;
+	 // The vector number is same as token
+	 uintr_received[vector] = 1;
+	 print_interrupt("Server", vector);
+	 // 调用Rust回调函数
+	 rust_interrupt_callback("Server", vector);
 }
 
 // 客户端中断处理程序
 void __attribute__ ((interrupt))
      __attribute__((target("general-regs-only", "inline-all-stringops")))
-     client_ui_handler(struct UintrFrame *ui_frame,
-	 	 unsigned long long vector) {
+     client_ui_handler(struct UintrFrame *_ui_frame __attribute__((unused)),
+	 unsigned long long vector) {
 
-	 	 // The vector number is same as the token
-	 	 uintr_received[vector] = 1;
+	 // The vector number is same as token
+	 uintr_received[vector] = 1;
+	 print_interrupt("Client", vector);
+	 // 调用Rust回调函数
+	 rust_interrupt_callback("Client", vector);
 }
 
 // 获取服务器中断标志

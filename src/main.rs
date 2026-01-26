@@ -1,18 +1,50 @@
-#![warn(unused)]
-use libc::{c_int, c_long, syscall};
-use std::thread;
-use std::os::unix::io::RawFd;
+/**
+ * UINTR-BI: User-Level Interrupt Benchmark for Bidirectional Communication
+ * 
+ * 该项目实现了基于用户态中断（UINTR）的双向通信基准测试，
+ * 用于测量服务器与客户端之间的通信性能。
+ * 
+ * 主要功能：
+ * - 基于用户态中断的双向通信
+ * - 详细的性能统计（延迟、吞吐量、CPU使用率等）
+ * - 支持可配置的消息数量
+ * - 线程安全的中断处理
+ * 
+ * 使用方法：
+ * ```
+ * cargo run -- <message_count>
+ * ```
+ * 
+ * 性能指标：
+ * - 消息速率（msg/s）
+ * - 数据速率（MB/s）
+ * - 平均延迟（us）
+ * - 最小/最大延迟（us）
+ * - 延迟分布（P50、P90、P99）
+ * - CPU使用率（%）
+ * 
+ * 技术实现：
+ * - Rust语言实现主要逻辑
+ * - C语言实现中断处理程序
+ * - 使用UINTR系统调用进行用户态中断管理
+ * - 内联汇编实现senduipi、stui、clui指令
+ */
+
+#[warn(unused)]
 use core::arch::asm;
-use std::time::{Instant, Duration};
+use libc::{c_int, c_long, syscall};
+use std::os::unix::io::RawFd;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::thread;
+use std::time::{Duration, Instant};
 
 // UINTR栈帧结构（必须与内核一致）
 #[repr(C)]
 pub struct UintrFrame {
-    pub rip: u64,      // 中断返回地址
-    pub rflags: u64,   // 标志寄存器
-    pub rsp: u64,      // 栈指针
+    pub rip: u64,    // 中断返回地址
+    pub rflags: u64, // 标志寄存器
+    pub rsp: u64,    // 栈指针
 }
 
 // Syscall numbers for UINTR
@@ -31,6 +63,14 @@ unsafe extern "C" {
     pub fn get_client_uintr_received() -> c_int;
     pub fn set_server_uintr_received(value: c_int);
     pub fn set_client_uintr_received(value: c_int);
+}
+
+// Rust回调函数，供C代码调用
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_interrupt_callback(handler_name: *const i8, vector: u64) {
+    let name = unsafe { std::ffi::CStr::from_ptr(handler_name) };
+    let name_str = name.to_str().unwrap_or("Unknown");
+    println!("Rust callback: {} received interrupt, vector={}", name_str, vector);
 }
 
 /// Sends a user interrupt to the specified index
@@ -82,10 +122,16 @@ pub unsafe fn uiret() {
 }
 
 // Safe wrappers for syscalls
-fn uintr_register_handler(handler: unsafe extern "C" fn(*mut UintrFrame, u64), flags: c_int) -> Result<c_int, String> {
+fn uintr_register_handler(
+    handler: unsafe extern "C" fn(*mut UintrFrame, u64),
+    flags: c_int,
+) -> Result<c_int, String> {
     let result = unsafe { syscall(__NR_UINTR_REGISTER_HANDLER, handler, flags) as c_int };
     if result < 0 {
-        Err(format!("uintr_register_handler failed: {}", std::io::Error::last_os_error()))
+        Err(format!(
+            "uintr_register_handler failed: {}",
+            std::io::Error::last_os_error()
+        ))
     } else {
         Ok(result)
     }
@@ -94,7 +140,10 @@ fn uintr_register_handler(handler: unsafe extern "C" fn(*mut UintrFrame, u64), f
 fn uintr_create_fd(vector: c_int, flags: c_int) -> Result<RawFd, String> {
     let result = unsafe { syscall(__NR_UINTR_CREATE_FD, vector, flags) as RawFd };
     if result < 0 {
-        Err(format!("uintr_create_fd failed: {}", std::io::Error::last_os_error()))
+        Err(format!(
+            "uintr_create_fd failed: {}",
+            std::io::Error::last_os_error()
+        ))
     } else {
         Ok(result)
     }
@@ -103,7 +152,10 @@ fn uintr_create_fd(vector: c_int, flags: c_int) -> Result<RawFd, String> {
 fn uintr_register_sender(fd: RawFd, flags: c_int) -> Result<c_int, String> {
     let result = unsafe { syscall(__NR_UINTR_REGISTER_SENDER, fd, flags) as c_int };
     if result < 0 {
-        Err(format!("uintr_register_sender failed: {}", std::io::Error::last_os_error()))
+        Err(format!(
+            "uintr_register_sender failed: {}",
+            std::io::Error::last_os_error()
+        ))
     } else {
         Ok(result)
     }
@@ -124,7 +176,9 @@ fn get_server_uintrfd() -> RawFd {
 }
 
 fn set_server_uintrfd(fd: RawFd) {
-    unsafe { SERVER_UINTRFD = fd; }
+    unsafe {
+        SERVER_UINTRFD = fd;
+    }
 }
 
 fn get_client_uintrfd() -> RawFd {
@@ -132,7 +186,9 @@ fn get_client_uintrfd() -> RawFd {
 }
 
 fn set_client_uintrfd(fd: RawFd) {
-    unsafe { CLIENT_UINTRFD = fd; }
+    unsafe {
+        CLIENT_UINTRFD = fd;
+    }
 }
 
 fn get_client_uipi_index() -> c_int {
@@ -140,7 +196,9 @@ fn get_client_uipi_index() -> c_int {
 }
 
 fn set_client_uipi_index(index: c_int) {
-    unsafe { CLIENT_UIPI_INDEX = index; }
+    unsafe {
+        CLIENT_UIPI_INDEX = index;
+    }
 }
 
 fn get_server_uipi_index() -> c_int {
@@ -148,7 +206,9 @@ fn get_server_uipi_index() -> c_int {
 }
 
 fn set_server_uipi_index(index: c_int) {
-    unsafe { SERVER_UIPI_INDEX = index; }
+    unsafe {
+        SERVER_UIPI_INDEX = index;
+    }
 }
 
 // Benchmark structure
@@ -182,25 +242,25 @@ impl Benchmarks {
             end_cpu_time: 0,
         }
     }
-    
+
     // 重置总开始时间
     fn reset_total_start(&mut self) {
         self.total_start = Instant::now();
         // 记录开始时的CPU时间
         self.start_cpu_time = self.get_cpu_time();
     }
-    
+
     // 开始测量单个操作
     fn start_operation(&mut self) {
         self.single_start = Instant::now();
     }
-    
+
     // 结束测量单个操作并更新统计
     fn end_operation(&mut self) {
         let duration = self.single_start.elapsed();
         self.update(duration);
     }
-    
+
     fn update(&mut self, duration: Duration) {
         let nanos = duration.as_nanos() as u64;
         self.latencies.push(nanos);
@@ -210,7 +270,7 @@ impl Benchmarks {
         self.squared_sum += nanos as f64 * nanos as f64;
         self.count += 1;
     }
-    
+
     // 获取CPU时间（纳秒）
     fn get_cpu_time(&self) -> u64 {
         // 简化实现，使用Instant::now()的系统时间戳作为替代
@@ -219,7 +279,7 @@ impl Benchmarks {
             .unwrap_or_default()
             .as_nanos() as u64
     }
-    
+
     // 计算分位数
     fn percentile(&self, p: f64) -> u64 {
         if self.latencies.is_empty() {
@@ -230,27 +290,28 @@ impl Benchmarks {
         let index = (sorted.len() as f64 * p / 100.0).floor() as usize;
         sorted[index.min(sorted.len() - 1)]
     }
-    
+
     fn evaluate(&mut self, args: &Arguments) {
         let total_time = self.total_start.elapsed();
         let average = self.sum / (self.count as u32);
-        
+
         let sigma = self.squared_sum / self.count as f64;
         let sigma = (sigma - (average.as_nanos() as f64).powi(2)).sqrt();
-        
+
         let message_rate = (self.count as f64) / total_time.as_secs_f64();
-        let message_rate_mb = (self.count as f64 * args.size as f64) / 1024.0 / 1024.0 / total_time.as_secs_f64();
-        
+        let message_rate_mb =
+            (self.count as f64 * args.size as f64) / 1024.0 / 1024.0 / total_time.as_secs_f64();
+
         // 记录结束时的CPU时间
         self.end_cpu_time = self.get_cpu_time();
         let cpu_time_used = self.end_cpu_time.saturating_sub(self.start_cpu_time);
         let cpu_usage = (cpu_time_used as f64 / total_time.as_nanos() as f64) * 100.0;
-        
+
         // 计算分位数
         let p50 = self.percentile(50.0);
         let p90 = self.percentile(90.0);
         let p99 = self.percentile(99.0);
-        
+
         // 转换为微秒，确保小值不会显示为0
         let total_time_ms = total_time.as_secs_f64() * 1000.0;
         let average_us = average.as_nanos() as f64 / 1000.0;
@@ -260,7 +321,7 @@ impl Benchmarks {
         let p50_us = p50 as f64 / 1000.0;
         let p90_us = p90 as f64 / 1000.0;
         let p99_us = p99 as f64 / 1000.0;
-        
+
         println!("\n============ RESULTS ================");
         println!("Message size:       {}", args.size);
         println!("Message count:      {}", args.count);
@@ -297,10 +358,7 @@ impl Arguments {
             }
         }
 
-        Arguments {
-            count,
-            size: 1,
-        }
+        Arguments { count, size: 1 }
     }
 }
 
@@ -313,12 +371,12 @@ fn server_uintrfd_wait(timeout_ms: Option<u64>) -> bool {
     let mut spin_count = 0;
     while unsafe { get_server_uintr_received() } == 0 {
         // 检查是否超时
-        if let Some(timeout) = timeout_ms {
-            if start.elapsed() > Duration::from_millis(timeout) {
-                return false;
-            }
+        if let Some(timeout) = timeout_ms
+            && start.elapsed() > Duration::from_millis(timeout)
+        {
+            return false;
         }
-        
+
         // 优化CPU使用率：先自旋几次，然后再yield
         spin_count += 1;
         if spin_count > 100 {
@@ -326,12 +384,16 @@ fn server_uintrfd_wait(timeout_ms: Option<u64>) -> bool {
             spin_count = 0;
         } else {
             // 短暂的空操作，减少CPU使用率
-            unsafe { asm!("pause", options(nostack, nomem)); }
+            unsafe {
+                asm!("pause", options(nostack, nomem));
+            }
         }
     }
 
     // 重置标志
-    unsafe { set_server_uintr_received(0); }
+    unsafe {
+        set_server_uintr_received(0);
+    }
     true
 }
 
@@ -342,12 +404,12 @@ fn client_uintrfd_wait(timeout_ms: Option<u64>) -> bool {
     let mut spin_count = 0;
     while unsafe { get_client_uintr_received() } == 0 {
         // 检查是否超时
-        if let Some(timeout) = timeout_ms {
-            if start.elapsed() > Duration::from_millis(timeout) {
-                return false;
-            }
+        if let Some(timeout) = timeout_ms
+            && start.elapsed() > Duration::from_millis(timeout)
+        {
+            return false;
         }
-        
+
         // 优化CPU使用率：先自旋几次，然后再yield
         spin_count += 1;
         if spin_count > 100 {
@@ -355,12 +417,16 @@ fn client_uintrfd_wait(timeout_ms: Option<u64>) -> bool {
             spin_count = 0;
         } else {
             // 短暂的空操作，减少CPU使用率
-            unsafe { asm!("pause", options(nostack, nomem)); }
+            unsafe {
+                asm!("pause", options(nostack, nomem));
+            }
         }
     }
 
     // 重置标志
-    unsafe { set_client_uintr_received(0); }
+    unsafe {
+        set_client_uintr_received(0);
+    }
     true
 }
 
@@ -395,7 +461,10 @@ fn setup_client() {
         }
     };
     set_client_uintrfd(client_descriptor);
-    println!("Client: Created uintrfd with descriptor {}", client_descriptor);
+    println!(
+        "Client: Created uintrfd with descriptor {}",
+        client_descriptor
+    );
 
     // 等待服务端设置其FD
     while get_server_uintrfd() < 0 {
@@ -414,7 +483,10 @@ fn setup_client() {
     };
 
     set_client_uipi_index(uipi_index);
-    println!("Client: Registered sender for server with UIPI index {}", uipi_index);
+    println!(
+        "Client: Registered sender for server with UIPI index {}",
+        uipi_index
+    );
 
     // 启用中断
     unsafe {
@@ -443,7 +515,10 @@ fn setup_server() {
         }
     };
     set_server_uintrfd(server_descriptor);
-    println!("Server: Created uintrfd with descriptor {}", server_descriptor);
+    println!(
+        "Server: Created uintrfd with descriptor {}",
+        server_descriptor
+    );
 
     // 等待客户端设置其FD
     while get_client_uintrfd() < 0 {
@@ -462,7 +537,10 @@ fn setup_server() {
     };
 
     set_server_uipi_index(uipi_index);
-    println!("Server: Registered sender for client with UIPI index {}", uipi_index);
+    println!(
+        "Server: Registered sender for client with UIPI index {}",
+        uipi_index
+    );
 
     // 启用中断
     unsafe {
@@ -472,7 +550,12 @@ fn setup_server() {
 }
 
 // 客户端通信函数
-fn client_communicate(args: Arguments, client_ready: std::sync::Arc<std::sync::atomic::AtomicBool>, server_ready: std::sync::Arc<std::sync::atomic::AtomicBool>, test_completed: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+fn client_communicate(
+    args: Arguments,
+    client_ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    server_ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    test_completed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
     setup_client();
 
     // 标记客户端已准备好
@@ -501,7 +584,12 @@ fn client_communicate(args: Arguments, client_ready: std::sync::Arc<std::sync::a
 }
 
 // 服务端通信函数
-fn server_communicate(args: Arguments, client_ready: std::sync::Arc<std::sync::atomic::AtomicBool>, server_ready: std::sync::Arc<std::sync::atomic::AtomicBool>, test_completed: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+fn server_communicate(
+    args: Arguments,
+    client_ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    server_ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    test_completed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
     setup_server();
 
     // 等待客户端准备好
@@ -530,7 +618,7 @@ fn server_communicate(args: Arguments, client_ready: std::sync::Arc<std::sync::a
         uintrfd_notify(get_server_uipi_index());
 
         // 等待响应，设置500ms超时
-        server_uintrfd_wait(Some(500));
+        while !server_uintrfd_wait(Some(500)) {}
 
         // 结束测量单个操作并更新统计
         bench.end_operation();
@@ -552,23 +640,28 @@ fn communicate(args: Arguments) {
     let client_ready = Arc::new(AtomicBool::new(false));
     let server_ready = Arc::new(AtomicBool::new(false));
     let test_completed = Arc::new(AtomicBool::new(false));
-    
+
     let client_ready_clone = client_ready.clone();
     let server_ready_clone = server_ready.clone();
     let test_completed_clone = test_completed.clone();
-    
+
     // 创建客户端线程
     let client_args = args.clone();
     let client_thread = thread::spawn(move || {
-        client_communicate(client_args, client_ready_clone, server_ready_clone, test_completed_clone);
+        client_communicate(
+            client_args,
+            client_ready_clone,
+            server_ready_clone,
+            test_completed_clone,
+        );
     });
-    
+
     // 创建服务端线程
     let server_args = args.clone();
     let server_thread = thread::spawn(move || {
         server_communicate(server_args, client_ready, server_ready, test_completed);
     });
-    
+
     // 等待两个线程完成
     client_thread.join().unwrap();
     server_thread.join().unwrap();
