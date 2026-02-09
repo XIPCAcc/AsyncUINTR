@@ -80,16 +80,26 @@ pub extern "C" fn rust_interrupt_callback(handler_name: *const libc::c_char, vec
             SERVER_TOKEN => {
                 if SERVER_INITIALIZED {
                     if let Some(ref token) = SERVER_TOKEN_OBJ {
-                        let mut interrupt_received = token.inner.interrupt_received.lock().unwrap();
-                        *interrupt_received = true;
+                        // println!("Interrupt callback: SERVER interrupt received");
+                        *token.inner.interrupt_received.lock().unwrap() = true;
+                        // 直接唤醒 waker
+                        if let Some(waker) = token.inner.waker.lock().unwrap().take() {
+                            // println!("Interrupt callback: SERVER waker woken");
+                            waker.wake();
+                        }
                     }
                 }
             }
             CLIENT_TOKEN => {
                 if CLIENT_INITIALIZED {
                     if let Some(ref token) = CLIENT_TOKEN_OBJ {
-                        let mut interrupt_received = token.inner.interrupt_received.lock().unwrap();
-                        *interrupt_received = true;
+                        // println!("Interrupt callback: CLIENT interrupt received");
+                        *token.inner.interrupt_received.lock().unwrap() = true;
+                        // 直接唤醒 waker
+                        if let Some(waker) = token.inner.waker.lock().unwrap().take() {
+                            // println!("Interrupt callback: CLIENT waker woken");
+                            waker.wake();
+                        }
                     }
                 }
             }
@@ -280,78 +290,6 @@ static mut CLIENT_TOKEN_OBJ: Option<UintrToken> = None;
 static mut SERVER_INITIALIZED: bool = false;
 static mut CLIENT_INITIALIZED: bool = false;
 
-// 供 Tokio IO Driver 调用的函数
-#[unsafe(no_mangle)]
-pub extern "C" fn check_uintr_pending() -> bool {
-    unsafe {
-        let server_pending = SERVER_TOKEN_OBJ.as_ref().map(|token| {
-            *token.inner.interrupt_received.lock().unwrap()
-        }).unwrap_or(false);
-        
-        let client_pending = CLIENT_TOKEN_OBJ.as_ref().map(|token| {
-            *token.inner.interrupt_received.lock().unwrap()
-        }).unwrap_or(false);
-        
-        let has_pending = server_pending || client_pending;
-        has_pending
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn process_uintr_wakers() -> u32 {
-    unsafe {
-        let mut waker_count = 0;
-        
-        if let Some(ref token) = SERVER_TOKEN_OBJ {
-            let should_wake = {
-                let mut interrupt_received = token.inner.interrupt_received.lock().unwrap();
-                if *interrupt_received {
-                    *interrupt_received = false;
-                    {
-                        let mut pending = token.inner.pending.lock().unwrap();
-                        *pending = true;
-                    }
-                    true
-                } else {
-                    false
-                }
-            };
-            
-            if should_wake {
-                if let Some(waker) = token.inner.waker.lock().unwrap().take() {
-                    waker.wake();
-                    waker_count += 1;
-                }
-            }
-        }
-        
-        if let Some(ref token) = CLIENT_TOKEN_OBJ {
-            let should_wake = {
-                let mut interrupt_received = token.inner.interrupt_received.lock().unwrap();
-                if *interrupt_received {
-                    *interrupt_received = false;
-                    {
-                        let mut pending = token.inner.pending.lock().unwrap();
-                        *pending = true;
-                    }
-                    true
-                } else {
-                    false
-                }
-            };
-            
-            if should_wake {
-                if let Some(waker) = token.inner.waker.lock().unwrap().take() {
-                    waker.wake();
-                    waker_count += 1;
-                }
-            }
-        }
-        
-        waker_count
-    }
-}
-
 /// 表示某个 UINTR 中断源的句柄
 #[derive(Clone)]
 pub struct UintrToken {
@@ -360,10 +298,8 @@ pub struct UintrToken {
 }
 
 struct Inner {
-    /// 中断是否已经到达（用于 check_uintr_pending）
+    /// 中断是否已经到达
     interrupt_received: Mutex<bool>,
-    /// 是否已经收到一次中断（用于 UintrFuture::poll）
-    pending: Mutex<bool>,
     /// 当前在等这个中断的任务的 waker（最多一个）
     waker: Mutex<Option<Waker>>,
 }
@@ -373,7 +309,6 @@ impl UintrToken {
         Self {
             inner: Arc::new(Inner {
                 interrupt_received: Mutex::new(false),
-                pending: Mutex::new(false),
                 waker: Mutex::new(None),
             }),
             name: name.to_string(),
@@ -390,14 +325,16 @@ impl Future for UintrFuture {
     type Output = std::io::Result<()>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // 先检查是否有 pending 中断，避免时序问题
-        let mut pending = self.token.inner.pending.lock().unwrap();
-        if *pending {
-            *pending = false;
+        // 检查是否有中断到达
+        let mut interrupt_received = self.token.inner.interrupt_received.lock().unwrap();
+        if *interrupt_received {
+            // println!("Poll {}: ready", self.token.name);
+            *interrupt_received = false;
             Poll::Ready(Ok(()))
         } else {
-            // 没有 pending，保存 waker 并返回 Pending
+            // 没有中断，保存 waker 并返回 Pending
             *self.token.inner.waker.lock().unwrap() = Some(cx.waker().clone());
+            // println!("Poll {}: pending", self.token.name);
             Poll::Pending
         }
     }
@@ -814,29 +751,23 @@ async fn client_communicate(
     println!("Client: Starting communication for {} messages", args.count);
 
     let mut message_count = 0;
-    
-    while message_count < args.count && !test_done.load(std::sync::atomic::Ordering::Acquire) {
-        if message_count % 100 == 0 {
-            println!("Client: Progress - {} / {}", message_count, args.count);
-        }
+    let uipi_index = get_client_uipi_index();
+    while message_count < args.count {
+        // if message_count % 100 == 0 {
+        //     println!("Client: Progress - {} / {}", message_count, args.count);
+        // }
         
         // 等待来自服务端的中断
+        // println!("Client: Waiting for server interrupt {}", message_count);
         if client_uintrfd_wait().await {
             // 发送响应中断
-            let uipi_index = get_client_uipi_index();
-            if uipi_index >= 0 {
-                if message_count % 100 == 0 {
-                    println!("Client: Sending response interrupt #{}", message_count);
-                }
-                uintrfd_notify(uipi_index);
-                unsafe {
-                    CLIENT_SENT_COUNT += 1;
-                }
-                message_count += 1;
-            } else {
-                println!("Error: Client UIPI index not set");
-                break;
+            // println!("Client: Sending response interrupt #{}", message_count);
+            uintrfd_notify(uipi_index);
+            unsafe {
+                CLIENT_SENT_COUNT += 1;
             }
+            message_count += 1;
+           
         }
     }
 
@@ -927,38 +858,26 @@ async fn server_communicate(
 
     // 重置总开始时间，确保从实际开始通信时计时
     bench.reset_total_start();
+    let uipi_index = get_server_uipi_index();
 
     for i in 0..args.count {
-        if i % 100 == 0 {
-            println!("Server: Progress - {} / {}", i, args.count);
-        }
+        // if i % 100 == 0 {
+        //     println!("Server: Progress - {} / {}", i, args.count);
+        // }
         
         // 开始测量单个操作
         bench.start_operation();
 
         // 发送中断到客户端
-        let uipi_index = get_server_uipi_index();
-        if uipi_index >= 0 {
-            uintrfd_notify(uipi_index);
-            unsafe {
-                SERVER_SENT_COUNT += 1;
-                if i % 100 == 0 {
-                    println!("Server: Sent interrupt #{}", i);
-                }
-            }
-        } else {
-            println!("Error: Server UIPI index not set");
-            break;
+        // println!("Server: Sending interrupt #{}", i);
+        uintrfd_notify(uipi_index);
+        unsafe {
+            SERVER_SENT_COUNT += 1;
         }
 
         // 等待响应
-        let mut retry_count = 0;
-        while !server_uintrfd_wait().await {
-            retry_count += 1;
-            if retry_count > 100 {
-                break;
-            }
-        }
+        // println!("Server: Waiting for client interrupt #{}", i);
+        server_uintrfd_wait().await;
 
         // 结束测量单个操作并更新统计
         bench.end_operation();
@@ -1065,15 +984,15 @@ let rt = tokio::runtime::Builder::new_current_thread()
             loop {
                 // 做一点无害的运算，确保线程时刻在跑
                 // 实践来看 2000 次循环 效果最好
-                for _ in 0..2000 {
+                for _ in 0..1000 {
                     std::hint::spin_loop();
-
                 }
+                // tokio::time::sleep(tokio::time::Duration::from_micros(200)).await;
                 // 可选：偶尔 yield 一下，避免饿死其他任务
                 tokio::task::yield_now().await;
                 // let mut i = I.lock().unwrap();
                 // *i += 1;
-                // println!("Yield worker thread {}", *i);
+                // println!("i: {}", *i);
             }
         });
         match args.mode {
