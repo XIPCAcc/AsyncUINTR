@@ -5,6 +5,10 @@ edition = "2024"
 
 [dependencies]
 libc = "0.2.175"
+tokio = { path = "./tokio/tokio", features = ["full", "uintr"] }
+
+[lints.rust]
+static_mut_refs = "allow"
 
 [build-dependencies]
 cc = "1.2"

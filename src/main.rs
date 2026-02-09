@@ -32,12 +32,19 @@
 
 #[warn(unused)]
 use core::arch::asm;
-use libc::{c_int, c_long, syscall};
-use std::os::unix::io::RawFd;
+use libc::{c_int, c_long, sleep, syscall};
+use std::os::unix::io::{RawFd, AsRawFd};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::thread;
 use std::time::{Duration, Instant};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Mutex;
+use std::task::{Context, Poll, Waker};
+use tokio::sync::Notify;
+
+static I: std::sync::Mutex<u32> = std::sync::Mutex::new(0);
 
 // UINTR栈帧结构（必须与内核一致）
 #[repr(C)]
@@ -67,10 +74,28 @@ unsafe extern "C" {
 
 // Rust回调函数，供C代码调用
 #[unsafe(no_mangle)]
-pub extern "C" fn rust_interrupt_callback(handler_name: *const i8, vector: u64) {
-    let name = unsafe { std::ffi::CStr::from_ptr(handler_name) };
-    let name_str = name.to_str().unwrap_or("Unknown");
-    println!("Rust callback: {} received interrupt, vector={}", name_str, vector);
+pub extern "C" fn rust_interrupt_callback(handler_name: *const libc::c_char, vector: u64) {
+    unsafe {
+        match vector {
+            SERVER_TOKEN => {
+                if SERVER_INITIALIZED {
+                    if let Some(ref token) = SERVER_TOKEN_OBJ {
+                        let mut interrupt_received = token.inner.interrupt_received.lock().unwrap();
+                        *interrupt_received = true;
+                    }
+                }
+            }
+            CLIENT_TOKEN => {
+                if CLIENT_INITIALIZED {
+                    if let Some(ref token) = CLIENT_TOKEN_OBJ {
+                        let mut interrupt_received = token.inner.interrupt_received.lock().unwrap();
+                        *interrupt_received = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Sends a user interrupt to the specified index
@@ -161,15 +186,235 @@ fn uintr_register_sender(fd: RawFd, flags: c_int) -> Result<c_int, String> {
     }
 }
 
+// 通过Unix Domain Socket发送文件描述符
+fn send_fd(socket: &UnixStream, fd: RawFd) -> Result<(), String> {
+    unsafe {
+        use libc::{msghdr, iovec, sendmsg, CMSG_FIRSTHDR, CMSG_DATA, SOL_SOCKET, SCM_RIGHTS};
+        
+        let mut buf = [0u8; 1];
+        let mut iov = iovec {
+            iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+            iov_len: 1,
+        };
+        
+        let fd_size = std::mem::size_of::<RawFd>();
+        let cmsg_space_size = libc::CMSG_SPACE(fd_size as u32) as usize;
+        let mut cmsg_space: Vec<u8> = vec![0; cmsg_space_size];
+        
+        let msg = msghdr {
+            msg_name: std::ptr::null_mut(),
+            msg_namelen: 0,
+            msg_iov: &mut iov,
+            msg_iovlen: 1,
+            msg_control: cmsg_space.as_mut_ptr() as *mut libc::c_void,
+            msg_controllen: cmsg_space.len(),
+            msg_flags: 0,
+        };
+        
+        let cmsg = CMSG_FIRSTHDR(&msg);
+        (*cmsg).cmsg_level = SOL_SOCKET;
+        (*cmsg).cmsg_type = SCM_RIGHTS;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(fd_size as u32) as usize;
+        
+        let data = CMSG_DATA(cmsg);
+        *(data as *mut RawFd) = fd;
+        
+        let result = sendmsg(socket.as_raw_fd(), &msg, 0);
+        if result < 0 {
+            return Err(format!("send_fd failed: {}", std::io::Error::last_os_error()));
+        }
+    }
+    Ok(())
+}
+
+// 通过Unix Domain Socket接收文件描述符
+fn recv_fd(socket: &UnixStream) -> Result<RawFd, String> {
+    unsafe {
+        use libc::{msghdr, iovec, recvmsg, CMSG_FIRSTHDR, CMSG_DATA, SOL_SOCKET, SCM_RIGHTS};
+        
+        let mut buf = [0u8; 1];
+        let mut iov = iovec {
+            iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+            iov_len: 1,
+        };
+        
+        let fd_size = std::mem::size_of::<RawFd>();
+        let cmsg_space_size = libc::CMSG_SPACE(fd_size as u32) as usize;
+        let mut cmsg_space: Vec<u8> = vec![0; cmsg_space_size];
+        
+        let mut msg = msghdr {
+            msg_name: std::ptr::null_mut(),
+            msg_namelen: 0,
+            msg_iov: &mut iov,
+            msg_iovlen: 1,
+            msg_control: cmsg_space.as_mut_ptr() as *mut libc::c_void,
+            msg_controllen: cmsg_space.len(),
+            msg_flags: 0,
+        };
+        
+        let result = recvmsg(socket.as_raw_fd(), &mut msg, 0);
+        if result < 0 {
+            return Err(format!("recv_fd failed: {}", std::io::Error::last_os_error()));
+        }
+        
+        let cmsg = CMSG_FIRSTHDR(&msg);
+        if cmsg.is_null() || (*cmsg).cmsg_level != SOL_SOCKET || (*cmsg).cmsg_type != SCM_RIGHTS {
+            return Err("recv_fd: no file descriptor received".to_string());
+        }
+        
+        let data = CMSG_DATA(cmsg);
+        let fd = *(data as *const RawFd);
+        Ok(fd)
+    }
+}
+
 // 定义向量/令牌常量
 const SERVER_TOKEN: u64 = 0;
 const CLIENT_TOKEN: u64 = 1;
+
+// 全局 UintrToken 实例
+static mut SERVER_TOKEN_OBJ: Option<UintrToken> = None;
+static mut CLIENT_TOKEN_OBJ: Option<UintrToken> = None;
+
+// 全局初始化标志
+static mut SERVER_INITIALIZED: bool = false;
+static mut CLIENT_INITIALIZED: bool = false;
+
+// 供 Tokio IO Driver 调用的函数
+#[unsafe(no_mangle)]
+pub extern "C" fn check_uintr_pending() -> bool {
+    unsafe {
+        let server_pending = SERVER_TOKEN_OBJ.as_ref().map(|token| {
+            *token.inner.interrupt_received.lock().unwrap()
+        }).unwrap_or(false);
+        
+        let client_pending = CLIENT_TOKEN_OBJ.as_ref().map(|token| {
+            *token.inner.interrupt_received.lock().unwrap()
+        }).unwrap_or(false);
+        
+        let has_pending = server_pending || client_pending;
+        has_pending
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn process_uintr_wakers() -> u32 {
+    unsafe {
+        let mut waker_count = 0;
+        
+        if let Some(ref token) = SERVER_TOKEN_OBJ {
+            let should_wake = {
+                let mut interrupt_received = token.inner.interrupt_received.lock().unwrap();
+                if *interrupt_received {
+                    *interrupt_received = false;
+                    {
+                        let mut pending = token.inner.pending.lock().unwrap();
+                        *pending = true;
+                    }
+                    true
+                } else {
+                    false
+                }
+            };
+            
+            if should_wake {
+                if let Some(waker) = token.inner.waker.lock().unwrap().take() {
+                    waker.wake();
+                    waker_count += 1;
+                }
+            }
+        }
+        
+        if let Some(ref token) = CLIENT_TOKEN_OBJ {
+            let should_wake = {
+                let mut interrupt_received = token.inner.interrupt_received.lock().unwrap();
+                if *interrupt_received {
+                    *interrupt_received = false;
+                    {
+                        let mut pending = token.inner.pending.lock().unwrap();
+                        *pending = true;
+                    }
+                    true
+                } else {
+                    false
+                }
+            };
+            
+            if should_wake {
+                if let Some(waker) = token.inner.waker.lock().unwrap().take() {
+                    waker.wake();
+                    waker_count += 1;
+                }
+            }
+        }
+        
+        waker_count
+    }
+}
+
+/// 表示某个 UINTR 中断源的句柄
+#[derive(Clone)]
+pub struct UintrToken {
+    inner: Arc<Inner>,
+    name: String,
+}
+
+struct Inner {
+    /// 中断是否已经到达（用于 check_uintr_pending）
+    interrupt_received: Mutex<bool>,
+    /// 是否已经收到一次中断（用于 UintrFuture::poll）
+    pending: Mutex<bool>,
+    /// 当前在等这个中断的任务的 waker（最多一个）
+    waker: Mutex<Option<Waker>>,
+}
+
+impl UintrToken {
+    pub fn new(name: &str) -> Self {
+        Self {
+            inner: Arc::new(Inner {
+                interrupt_received: Mutex::new(false),
+                pending: Mutex::new(false),
+                waker: Mutex::new(None),
+            }),
+            name: name.to_string(),
+        }
+    }
+}
+
+/// UINTR 异步 Future
+pub struct UintrFuture {
+    token: UintrToken,
+}
+
+impl Future for UintrFuture {
+    type Output = std::io::Result<()>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // 先检查是否有 pending 中断，避免时序问题
+        let mut pending = self.token.inner.pending.lock().unwrap();
+        if *pending {
+            *pending = false;
+            Poll::Ready(Ok(()))
+        } else {
+            // 没有 pending，保存 waker 并返回 Pending
+            *self.token.inner.waker.lock().unwrap() = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+}
+
+/// 异步等待 UINTR 中断
+pub async fn uintr(token: UintrToken) -> std::io::Result<()> {
+    UintrFuture { token }.await
+}
 
 // 全局状态 - 使用两个文件描述符
 static mut SERVER_UINTRFD: RawFd = -1;
 static mut CLIENT_UINTRFD: RawFd = -1;
 static mut CLIENT_UIPI_INDEX: c_int = -1;
 static mut SERVER_UIPI_INDEX: c_int = -1;
+static mut SERVER_SENT_COUNT: u32 = 0;
+static mut CLIENT_SENT_COUNT: u32 = 0;
 
 fn get_server_uintrfd() -> RawFd {
     unsafe { SERVER_UINTRFD }
@@ -340,94 +585,74 @@ impl Benchmarks {
     }
 }
 
+// 运行模式
+#[derive(Clone, PartialEq)]
+enum Mode {
+    Server,
+    Client,
+    Both,
+}
+
 // Arguments structure
 #[derive(Clone)]
 struct Arguments {
     count: u32,
     size: usize,
+    mode: Mode,
 }
 
 impl Arguments {
     fn parse() -> Self {
         let args: Vec<String> = std::env::args().collect();
         let mut count = 1000;
+        let mut mode = Mode::Both;
 
         for arg in &args[1..] {
-            if let Ok(c) = arg.parse() {
+            if arg == "--server" {
+                mode = Mode::Server;
+            } else if arg == "--client" {
+                mode = Mode::Client;
+            } else if let Ok(c) = arg.parse() {
                 count = c;
             }
         }
 
-        Arguments { count, size: 1 }
+        Arguments { count, size: 1, mode }
     }
 }
 
 // 中断处理程序现在使用C语言版本实现
 
-// 服务器等待UINTR，支持超时
-fn server_uintrfd_wait(timeout_ms: Option<u64>) -> bool {
-    // 轮询直到接收到中断或超时
-    let start = Instant::now();
-    let mut spin_count = 0;
-    while unsafe { get_server_uintr_received() } == 0 {
-        // 检查是否超时
-        if let Some(timeout) = timeout_ms
-            && start.elapsed() > Duration::from_millis(timeout)
-        {
-            return false;
-        }
-
-        // 优化CPU使用率：先自旋几次，然后再yield
-        spin_count += 1;
-        if spin_count > 100 {
-            std::thread::yield_now();
-            spin_count = 0;
-        } else {
-            // 短暂的空操作，减少CPU使用率
-            unsafe {
-                asm!("pause", options(nostack, nomem));
-            }
-        }
+// 服务器等待UINTR
+async fn server_uintrfd_wait() -> bool {
+    let token = unsafe {
+        SERVER_TOKEN_OBJ.as_ref().expect("SERVER_TOKEN_OBJ not initialized").clone()
+    };
+    
+    match uintr(token).await {
+        Ok(()) => {
+            true
+        },
+        Err(_) => {
+            false
+        },
     }
-
-    // 重置标志
-    unsafe {
-        set_server_uintr_received(0);
-    }
-    true
 }
 
-// 客户端等待UINTR，支持超时
-fn client_uintrfd_wait(timeout_ms: Option<u64>) -> bool {
-    // 轮询直到接收到中断或超时
-    let start = Instant::now();
-    let mut spin_count = 0;
-    while unsafe { get_client_uintr_received() } == 0 {
-        // 检查是否超时
-        if let Some(timeout) = timeout_ms
-            && start.elapsed() > Duration::from_millis(timeout)
-        {
-            return false;
-        }
-
-        // 优化CPU使用率：先自旋几次，然后再yield
-        spin_count += 1;
-        if spin_count > 100 {
-            std::thread::yield_now();
-            spin_count = 0;
-        } else {
-            // 短暂的空操作，减少CPU使用率
-            unsafe {
-                asm!("pause", options(nostack, nomem));
-            }
-        }
+// 客户端等待UINTR
+async fn client_uintrfd_wait() -> bool {
+    let token = unsafe {
+        CLIENT_TOKEN_OBJ.as_ref().expect("CLIENT_TOKEN_OBJ not initialized").clone()
+    };
+    
+    match uintr(token).await {
+        Ok(()) => {
+            true
+        },
+        Err(_) => {
+            false
+        },
     }
-
-    // 重置标志
-    unsafe {
-        set_client_uintr_received(0);
-    }
-    true
 }
 
 // 发送UINTR
@@ -442,7 +667,13 @@ fn uintrfd_notify(uipi_index: c_int) {
 }
 
 // 客户端设置
-fn setup_client() {
+async fn setup_client() {
+    // 初始化客户端 UintrToken
+    unsafe {
+        CLIENT_TOKEN_OBJ = Some(UintrToken::new("CLIENT"));
+        CLIENT_INITIALIZED = true;
+    }
+
     // 注册客户端中断处理程序
     match uintr_register_handler(client_ui_handler, 0) {
         Ok(res) => {
@@ -453,8 +684,8 @@ fn setup_client() {
         }
     }
 
-    // 创建客户端uintrfd文件描述符
-    let client_descriptor = match uintr_create_fd(CLIENT_TOKEN as c_int, 0) {
+    // 创建客户端uintrfd文件描述符 - 使用向量1（CLIENT_TOKEN）
+    let client_descriptor = match uintr_create_fd(1, 0) {
         Ok(fd) => fd,
         Err(err) => {
             panic!("Client interrupt vector registration error: {}", err);
@@ -462,30 +693,8 @@ fn setup_client() {
     };
     set_client_uintrfd(client_descriptor);
     println!(
-        "Client: Created uintrfd with descriptor {}",
+        "Client: Created uintrfd with descriptor {} (vector 1)",
         client_descriptor
-    );
-
-    // 等待服务端设置其FD
-    while get_server_uintrfd() < 0 {
-        std::thread::sleep(Duration::from_micros(10));
-    }
-
-    // 注册发送者
-    let uipi_index = match uintr_register_sender(get_server_uintrfd(), 0) {
-        Ok(index) => index,
-        Err(err) => {
-            unsafe {
-                libc::close(client_descriptor);
-            }
-            panic!("Sender register error for server: {}", err);
-        }
-    };
-
-    set_client_uipi_index(uipi_index);
-    println!(
-        "Client: Registered sender for server with UIPI index {}",
-        uipi_index
     );
 
     // 启用中断
@@ -496,7 +705,13 @@ fn setup_client() {
 }
 
 // 服务端设置
-fn setup_server() {
+async fn setup_server() {
+    // 初始化服务器 UintrToken
+    unsafe {
+        SERVER_TOKEN_OBJ = Some(UintrToken::new("SERVER"));
+        SERVER_INITIALIZED = true;
+    }
+
     // 注册服务器中断处理程序
     match uintr_register_handler(server_ui_handler, 0) {
         Ok(res) => {
@@ -507,8 +722,8 @@ fn setup_server() {
         }
     }
 
-    // 创建服务器uintrfd文件描述符
-    let server_descriptor = match uintr_create_fd(SERVER_TOKEN as c_int, 0) {
+    // 创建服务器uintrfd文件描述符 - 使用向量0（SERVER_TOKEN）
+    let server_descriptor = match uintr_create_fd(0, 0) {
         Ok(fd) => fd,
         Err(err) => {
             panic!("Server interrupt vector registration error: {}", err);
@@ -516,30 +731,8 @@ fn setup_server() {
     };
     set_server_uintrfd(server_descriptor);
     println!(
-        "Server: Created uintrfd with descriptor {}",
+        "Server: Created uintrfd with descriptor {} (vector 0)",
         server_descriptor
-    );
-
-    // 等待客户端设置其FD
-    while get_client_uintrfd() < 0 {
-        std::thread::sleep(Duration::from_micros(10));
-    }
-
-    // 注册发送者
-    let uipi_index = match uintr_register_sender(get_client_uintrfd(), 0) {
-        Ok(index) => index,
-        Err(err) => {
-            unsafe {
-                libc::close(server_descriptor);
-            }
-            panic!("Sender register error for client: {}", err);
-        }
-    };
-
-    set_server_uipi_index(uipi_index);
-    println!(
-        "Server: Registered sender for client with UIPI index {}",
-        uipi_index
     );
 
     // 启用中断
@@ -550,33 +743,100 @@ fn setup_server() {
 }
 
 // 客户端通信函数
-fn client_communicate(
+async fn client_communicate(
     args: Arguments,
-    client_ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    server_ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    test_completed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    _client_ready: Arc<Notify>,
+    _server_ready: Arc<Notify>,
+    _test_completed: Arc<Notify>,
+    test_done: Arc<AtomicBool>,
 ) {
-    setup_client();
+    setup_client().await;
 
-    // 标记客户端已准备好
-    client_ready.store(true, std::sync::atomic::Ordering::Release);
     println!("Client: Ready for communication");
+    println!("Client: Starting communication for {} messages", args.count);
 
-    // 等待服务器准备好
-    while !server_ready.load(std::sync::atomic::Ordering::Acquire) {
-        std::thread::yield_now();
+    // 连接到server的Unix Domain Socket
+    let socket_path = "/tmp/uintr.sock";
+    let mut server_socket = None;
+    for _ in 0..1000 {
+        match UnixStream::connect(socket_path) {
+            Ok(s) => {
+                server_socket = Some(s);
+                println!("Client: Connected to server socket");
+                break;
+            }
+            Err(_) => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
     }
-    println!("Client: Server is ready, starting communication");
+
+    if let Some(s) = server_socket {
+        // 发送client的文件描述符给server
+        let client_fd = get_client_uintrfd();
+        match send_fd(&s, client_fd) {
+            Ok(_) => {
+                println!("Client: Sent client file descriptor {}", client_fd);
+            }
+            Err(e) => {
+                panic!("Client: Failed to send client fd: {}", e);
+            }
+        }
+
+        // 接收server的文件描述符
+        let server_fd = match recv_fd(&s) {
+            Ok(fd) => {
+                set_server_uintrfd(fd);
+                println!("Client: Received server file descriptor {}", fd);
+                fd
+            }
+            Err(e) => {
+                panic!("Client: Failed to receive server fd: {}", e);
+            }
+        };
+
+        // 注册发送者
+        let _uipi_index = match uintr_register_sender(server_fd, 0) {
+            Ok(index) => {
+                set_client_uipi_index(index);
+                println!("Client: Registered sender for server with UIPI index {}", index);
+                index
+            }
+            Err(err) => {
+                println!("Warning: Failed to register sender for server: {}", err);
+                -1
+            }
+        };
+    } else {
+        panic!("Client: Timeout connecting to server socket");
+    }
 
     println!("Client: Starting communication for {} messages", args.count);
 
     let mut message_count = 0;
-    while message_count < args.count && !test_completed.load(std::sync::atomic::Ordering::Acquire) {
-        // 等待来自服务端的中断，设置500ms超时
-        if client_uintrfd_wait(Some(500)) {
+    
+    while message_count < args.count && !test_done.load(std::sync::atomic::Ordering::Acquire) {
+        if message_count % 100 == 0 {
+            println!("Client: Progress - {} / {}", message_count, args.count);
+        }
+        
+        // 等待来自服务端的中断
+        if client_uintrfd_wait().await {
             // 发送响应中断
-            uintrfd_notify(get_client_uipi_index());
-            message_count += 1;
+            let uipi_index = get_client_uipi_index();
+            if uipi_index >= 0 {
+                if message_count % 100 == 0 {
+                    println!("Client: Sending response interrupt #{}", message_count);
+                }
+                uintrfd_notify(uipi_index);
+                unsafe {
+                    CLIENT_SENT_COUNT += 1;
+                }
+                message_count += 1;
+            } else {
+                println!("Error: Client UIPI index not set");
+                break;
+            }
         }
     }
 
@@ -584,23 +844,81 @@ fn client_communicate(
 }
 
 // 服务端通信函数
-fn server_communicate(
+async fn server_communicate(
     args: Arguments,
-    client_ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    server_ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    test_completed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    _client_ready: Arc<Notify>,
+    _server_ready: Arc<Notify>,
+    _test_completed: Arc<Notify>,
+    test_done: Arc<AtomicBool>,
 ) {
-    setup_server();
+    setup_server().await;
 
-    // 等待客户端准备好
-    while !client_ready.load(std::sync::atomic::Ordering::Acquire) {
-        std::thread::yield_now();
-    }
-    println!("Server: Client is ready, starting communication");
-
-    // 标记服务器已准备好
-    server_ready.store(true, std::sync::atomic::Ordering::Release);
     println!("Server: Ready for communication");
+    println!("Server: Starting communication for {} messages", args.count);
+
+    // 创建并监听Unix Domain Socket
+    let socket_path = "/tmp/uintr.sock";
+    let _ = std::fs::remove_file(socket_path);
+    let listener = UnixListener::bind(socket_path)
+        .expect("Server: Failed to bind socket");
+    listener.set_nonblocking(true)
+        .expect("Server: Failed to set nonblocking");
+    println!("Server: Listening on {}", socket_path);
+
+    // 等待客户端连接
+    let mut client_socket = None;
+    for _ in 0..1000 {
+        match listener.accept() {
+            Ok((s, _)) => {
+                client_socket = Some(s);
+                println!("Server: Client connected");
+                break;
+            }
+            Err(_) => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+
+    if let Some(s) = client_socket {
+        // 接收client的文件描述符
+        let client_fd = match recv_fd(&s) {
+            Ok(fd) => {
+                set_client_uintrfd(fd);
+                println!("Server: Received client file descriptor {}", fd);
+                fd
+            }
+            Err(e) => {
+                panic!("Server: Failed to receive client fd: {}", e);
+            }
+        };
+
+        // 发送server的文件描述符给client
+        let server_fd = get_server_uintrfd();
+        match send_fd(&s, server_fd) {
+            Ok(_) => {
+                println!("Server: Sent server file descriptor {}", server_fd);
+            }
+            Err(e) => {
+                panic!("Server: Failed to send server fd: {}", e);
+            }
+        }
+
+        // 注册发送者
+        let _uipi_index = match uintr_register_sender(client_fd, 0) {
+            Ok(index) => {
+                set_server_uipi_index(index);
+                println!("Server: Registered sender for client with UIPI index {}", index);
+                index
+            }
+            Err(err) => {
+                println!("Warning: Failed to register sender for client: {}", err);
+                -1
+            }
+        };
+    } else {
+        panic!("Server: Timeout waiting for client connection");
+    }
 
     // 设置基准测试
     let mut bench = Benchmarks::new();
@@ -610,15 +928,37 @@ fn server_communicate(
     // 重置总开始时间，确保从实际开始通信时计时
     bench.reset_total_start();
 
-    for _ in 0..args.count {
+    for i in 0..args.count {
+        if i % 100 == 0 {
+            println!("Server: Progress - {} / {}", i, args.count);
+        }
+        
         // 开始测量单个操作
         bench.start_operation();
 
         // 发送中断到客户端
-        uintrfd_notify(get_server_uipi_index());
+        let uipi_index = get_server_uipi_index();
+        if uipi_index >= 0 {
+            uintrfd_notify(uipi_index);
+            unsafe {
+                SERVER_SENT_COUNT += 1;
+                if i % 100 == 0 {
+                    println!("Server: Sent interrupt #{}", i);
+                }
+            }
+        } else {
+            println!("Error: Server UIPI index not set");
+            break;
+        }
 
-        // 等待响应，设置500ms超时
-        while !server_uintrfd_wait(Some(500)) {}
+        // 等待响应
+        let mut retry_count = 0;
+        while !server_uintrfd_wait().await {
+            retry_count += 1;
+            if retry_count > 100 {
+                break;
+            }
+        }
 
         // 结束测量单个操作并更新统计
         bench.end_operation();
@@ -628,61 +968,191 @@ fn server_communicate(
     bench.evaluate(&args);
 
     // 标记测试已完成
-    test_completed.store(true, std::sync::atomic::Ordering::Release);
+    test_done.store(true, std::sync::atomic::Ordering::Release);
     println!("Server: Test completed");
 
     println!("Server: Communication complete");
 }
 
 // 主通信函数
-fn communicate(args: Arguments) {
-    // 创建一个同步机制，确保客户端先准备好
-    let client_ready = Arc::new(AtomicBool::new(false));
-    let server_ready = Arc::new(AtomicBool::new(false));
-    let test_completed = Arc::new(AtomicBool::new(false));
+async fn communicate(args: Arguments) {
+    match args.mode {
+        Mode::Server => {
+            println!("Running as server");
+            // 创建同步机制
+            let client_ready = Arc::new(Notify::new());
+            let server_ready = Arc::new(Notify::new());
+            let test_completed = Arc::new(Notify::new());
+            let test_done = Arc::new(AtomicBool::new(false));
 
-    let client_ready_clone = client_ready.clone();
-    let server_ready_clone = server_ready.clone();
-    let test_completed_clone = test_completed.clone();
+            // 只运行服务端任务
+            server_communicate(args, client_ready, server_ready, test_completed, test_done).await;
+        }
+        Mode::Client => {
+            println!("Running as client");
+            // 创建同步机制
+            let client_ready = Arc::new(Notify::new());
+            let server_ready = Arc::new(Notify::new());
+            let test_completed = Arc::new(Notify::new());
+            let test_done = Arc::new(AtomicBool::new(false));
 
-    // 创建客户端线程
-    let client_args = args.clone();
-    let client_thread = thread::spawn(move || {
-        client_communicate(
-            client_args,
-            client_ready_clone,
-            server_ready_clone,
-            test_completed_clone,
-        );
-    });
+            // 只运行客户端任务
+            client_communicate(args, client_ready, server_ready, test_completed, test_done).await;
+        }
+        Mode::Both => {
+            println!("Running as both server and client (same process)");
+            // 创建一个同步机制，确保客户端先准备好
+            let client_ready = Arc::new(Notify::new());
+            let server_ready = Arc::new(Notify::new());
+            let test_completed = Arc::new(Notify::new());
+            let test_done = Arc::new(AtomicBool::new(false));
 
-    // 创建服务端线程
-    let server_args = args.clone();
-    let server_thread = thread::spawn(move || {
-        server_communicate(server_args, client_ready, server_ready, test_completed);
-    });
+            let client_ready_clone = client_ready.clone();
+            let server_ready_clone = server_ready.clone();
+            let test_completed_clone = test_completed.clone();
+            let test_done_clone = test_done.clone();
 
-    // 等待两个线程完成
-    client_thread.join().unwrap();
-    server_thread.join().unwrap();
+            // 创建客户端任务
+            let client_args = args.clone();
+            let client_task = tokio::task::spawn(async move {
+                client_communicate(
+                    client_args,
+                    client_ready_clone,
+                    server_ready_clone,
+                    test_completed_clone,
+                    test_done_clone,
+                ).await;
+            });
+
+            // 创建服务端任务
+            let server_args = args.clone();
+            let server_task = tokio::task::spawn(async move {
+                server_communicate(server_args, client_ready, server_ready, test_completed, test_done).await;
+            });
+
+            // 等待两个任务完成
+            client_task.await.unwrap();
+            server_task.await.unwrap();
+        }
+    }
 }
 
 fn main() {
     let args = Arguments::parse();
 
-    // 运行通信测试
-    communicate(args);
+    // let rt = tokio::runtime::Builder::new_multi_thread()
+    //     .worker_threads(1)
+    //     .enable_all()
+    //     .build()
+    //     .unwrap();
+let rt = tokio::runtime::Builder::new_current_thread()
+    .enable_all()
+    // .thread_keep_alive(std::time::Duration::MAX)  // 无限期保持线程活跃，只对spawn blocking任务生效
+    .build()
+    .unwrap();
 
-    // 清理资源
-    let server_fd = get_server_uintrfd();
-    let client_fd = get_client_uintrfd();
+    rt.block_on(async {
+        // 创建定时唤醒任务，定期唤醒 worker 线程
+        // tokio::spawn(async {
+        //     let mut interval = tokio::time::interval(tokio::time::Duration::from_micros(5));
+        //     loop {
+        //         interval.tick().await;
+        //         // println!("Wakeup worker thread");
+        //     }
+        // });
+        tokio::spawn(async {
+            // tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            loop {
+                // 做一点无害的运算，确保线程时刻在跑
+                // 实践来看 2000 次循环 效果最好
+                for _ in 0..2000 {
+                    std::hint::spin_loop();
 
-    unsafe {
-        if server_fd >= 0 {
-            libc::close(server_fd);
+                }
+                // 可选：偶尔 yield 一下，避免饿死其他任务
+                tokio::task::yield_now().await;
+                // let mut i = I.lock().unwrap();
+                // *i += 1;
+                // println!("Yield worker thread {}", *i);
+            }
+        });
+        match args.mode {
+            Mode::Server => {
+                println!("Running as server");
+                // 创建同步机制
+                let client_ready = Arc::new(Notify::new());
+                let server_ready = Arc::new(Notify::new());
+                let test_completed = Arc::new(Notify::new());
+                let test_done = Arc::new(AtomicBool::new(false));
+
+                let server_task = tokio::spawn(server_communicate(
+                    args.clone(),
+                    client_ready,
+                    server_ready,
+                    test_completed,
+                    test_done.clone(),
+                ));
+
+                server_task.await.unwrap();
+            }
+            Mode::Client => {
+                println!("Running as client");
+                // 创建同步机制
+                let client_ready = Arc::new(Notify::new());
+                let server_ready = Arc::new(Notify::new());
+                let test_completed = Arc::new(Notify::new());
+                let test_done = Arc::new(AtomicBool::new(false));
+
+                let client_task = tokio::spawn(client_communicate(
+                    args.clone(),
+                    client_ready,
+                    server_ready,
+                    test_completed,
+                    test_done.clone(),
+                ));
+
+                client_task.await.unwrap();
+            }
+            Mode::Both => {
+                println!("Running as both server and client (same process)");
+                // 创建同步机制
+                let client_ready = Arc::new(Notify::new());
+                let server_ready = Arc::new(Notify::new());
+                let test_completed = Arc::new(Notify::new());
+                let test_done = Arc::new(AtomicBool::new(false));
+
+                let mut server_task = tokio::spawn(server_communicate(
+                    args.clone(),
+                    client_ready.clone(),
+                    server_ready.clone(),
+                    test_completed.clone(),
+                    test_done.clone(),
+                ));
+
+                let mut client_task = tokio::spawn(client_communicate(
+                    args.clone(),
+                    client_ready,
+                    server_ready,
+                    test_completed,
+                    test_done.clone(),
+                ));
+
+                tokio::select! {
+                    _ = &mut server_task => {
+                        test_done.store(true, std::sync::atomic::Ordering::Release);
+                        let _ = client_task.abort();
+                    }
+                    _ = &mut client_task => {
+                        test_done.store(true, std::sync::atomic::Ordering::Release);
+                        let _ = server_task.abort();
+                    }
+                }
+            }
         }
-        if client_fd >= 0 {
-            libc::close(client_fd);
-        }
-    }
+
+        // 清理临时文件
+        let _ = std::fs::remove_file("/tmp/uintr.sock");
+        let _ = std::fs::remove_file("/tmp/server_uintr_info");
+        let _ = std::fs::remove_file("/tmp/client_uintr_info");
+    });
 }

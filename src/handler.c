@@ -36,8 +36,7 @@ void __attribute__ ((interrupt))
 
 	 // The vector number is same as token
 	 uintr_received[vector] = 1;
-	 print_interrupt("Server", vector);
-	 // 调用Rust回调函数
+	 // 调用Rust回调函数（Rust回调函数会处理打印）
 	 rust_interrupt_callback("Server", vector);
 }
 
@@ -49,8 +48,7 @@ void __attribute__ ((interrupt))
 
 	 // The vector number is same as token
 	 uintr_received[vector] = 1;
-	 print_interrupt("Client", vector);
-	 // 调用Rust回调函数
+	 // 调用Rust回调函数（Rust回调函数会处理打印）
 	 rust_interrupt_callback("Client", vector);
 }
 
