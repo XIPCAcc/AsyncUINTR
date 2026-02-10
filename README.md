@@ -5,6 +5,7 @@
 ## 功能特性
 
 - **双向通信**：服务器和客户端使用用户态中断进行通信
+- **独立进程**：服务器和客户端作为独立进程运行，更真实地模拟实际场景
 - **性能指标**：详细的测量包括：
   - 平均、最小、最大延迟
   - 延迟分布（P50、P90、P99）
@@ -13,6 +14,7 @@
 - **线程安全**：使用原子操作确保跨线程通信安全
 - **独立处理程序**：服务器和客户端使用独立的中断处理程序
 - **C-Rust互操作**：C语言中断处理程序可以调用Rust回调函数
+- **管道+Watch Channel**：使用管道和Tokio的watch channel实现可靠的异步中断处理
 
 ## 模块说明
 
@@ -22,59 +24,95 @@
 
 ## 使用方法
 
+### 服务器模式
+
 ```bash
-cargo run -- <message_count>
+cargo run -- --server
+```
+
+### 客户端模式
+
+```bash
+cargo run -- --client
 ```
 
 ### 参数说明
 
+- `--server`：以服务器模式运行
+- `--client`：以客户端模式运行
 - `message_count`：服务器和客户端之间交换的消息数量（默认：1000）
 
 ### 示例
 
 运行10条消息的测试：
+
+服务器：
 ```bash
-cargo run -- 10
+cargo run -- --server 10
+```
+
+客户端：
+```bash
+cargo run -- --client 10
 ```
 
 ## 输出示例
 
+### 服务器输出
+
 ```
-Client: Interrupt handler registered successfully: 0
-Client: Created uintrfd with descriptor 3
+Running as server
 Server: Interrupt handler registered successfully: 0
-Server: Created uintrfd with descriptor 4
-Server: Registered sender for client with UIPI index 0
+Server: Created uintrfd with descriptor 11 (vector 0)
 Server: Interrupts enabled
-Client: Registered sender for server with UIPI index 1
-Client: Interrupts enabled
-Client: Ready for communication
-Server: Client is ready, starting communication
 Server: Ready for communication
-Client: Server is ready, starting communication
-Client: Starting communication for 100 messages
-Server: Starting communication for 100 messages
-Client: Received interrupt, vector=1
-Rust callback: Client received interrupt, vector=1
-Server: Received interrupt, vector=0
-Rust callback: Server received interrupt, vector=0
+Server: Starting communication for 1000 messages
+Server: Listening on /tmp/uintr.sock
+Server: Client connected
+Server: Received client file descriptor 14
+Server: Sent server file descriptor 11
+Server: Registered sender for client with UIPI index 0
+Server: Starting communication for 1000 messages
+Interrupt callback: SERVER interrupt received
 ...
 
 ============ RESULTS ================
 Message size:       1
-Message count:      100
-Total duration:     0.097551 ms
-Average duration:   0.897000 us
-Minimum duration:   0.828000 us
-Maximum duration:   1.297000 us
-Standard deviation: 0.062508 us
-Latency P50:        0.885000 us
-Latency P90:        0.924000 us
-Latency P99:        1.297000 us
-Message rate:       1,025,026 msg/s
-Message rate:       0.977 MB/s
+Message count:      1000
+Total duration:     172.927719 ms
+Average duration:   172.777000 us
+Minimum duration:   38.535000 us
+Maximum duration:   16019.181000 us
+Standard deviation: 761.919443 us
+Latency P50:        97.213000 us
+Latency P90:        128.734000 us
+Latency P99:        2089.781000 us
+Message rate:       5783 msg/s
+Message rate:       0.006 MB/s
 CPU usage:          100.00%
 =====================================
+Server: Test completed
+Server: Communication complete
+```
+
+### 客户端输出
+
+```
+Running as client
+Client: Interrupt handler registered successfully: 0
+Client: Created uintrfd with descriptor 11 (vector 1)
+Client: Interrupts enabled
+Client: Ready for communication
+Client: Starting communication for 1000 messages
+Client: Connected to server socket
+Client: Sent client file descriptor 11
+Interrupt callback: CLIENT interrupt received
+Client: Received server file descriptor 13
+Client: Registered sender for server with UIPI index 0
+Client: Starting communication for 1000 messages
+Interrupt callback: CLIENT interrupt received
+...
+Client: Communication complete
 ```
 
 ## 性能指标说明
@@ -94,7 +132,7 @@ CPU usage:          100.00%
 ## 系统要求
 
 - Rust 1.60+
-- Linux内核支持UINTR
+- Linux内核支持UINTR (CONFIG_X86_USER_INTERRUPTS=y)
 - 支持用户态中断的硬件
 - GCC编译器（用于C代码编译）
 
@@ -121,6 +159,22 @@ Cargo.toml           # 项目配置
 ```
 
 ## 技术细节
+
+### 中断处理流程
+
+1. **中断回调**：C语言中断处理程序调用Rust回调函数
+2. **管道写入**：回调函数写入管道并设置pending标志
+3. **事件广播**：管道读取任务读取数据并通过watch channel广播事件
+4. **异步等待**：使用watch receiver等待事件并处理
+
+### 管道+Watch Channel实现
+
+参考Tokio的signal处理机制，使用以下组件：
+
+- **管道**：用于内核级别的唤醒，确保可靠地唤醒epoll
+- **AtomicBool**：用于标记中断是否到达
+- **Watch Channel**：用于在异步任务之间广播事件
+- **计数器**：确保每次都能触发changed事件
 
 ### 中断处理程序属性
 
@@ -156,29 +210,6 @@ C语言中断处理程序使用以下GCC属性：
 - 避免函数调用开销
 - 减少栈使用
 - 提高中断处理程序的执行速度
-
-##### 为什么不能在中断处理程序中调用printf？
-
-中断处理程序中调用`printf`会导致编译错误，但是能在Rust回调函数`rust_interrupt_callback`调用`println!`（只是能编译过，不代表是安全的）
-
-5. **实际代码示例**：
-   ```c
-   // 中断处理程序（C）- 只设置标志
-   void server_ui_handler(...) {
-       uintr_received[vector] = 1;  // 最小化操作
-       rust_interrupt_callback("Server", vector);  // 可以调用，但实际处理在Rust中
-   }
-   ```
-
-   ```rust
-   // Rust回调函数 - 可以安全使用println!
-   #[no_mangle]
-   pub extern "C" fn rust_interrupt_callback(handler_name: &CStr, vector: u64) {
-       let name = handler_name.to_str().unwrap();
-       println!("Rust callback: {} received interrupt, vector={}", name, vector);
-       // 可以执行任意复杂的逻辑
-   }
-   ```
 
 ### C-Rust互操作
 
