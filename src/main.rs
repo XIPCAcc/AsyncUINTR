@@ -32,17 +32,19 @@
 
 #[warn(unused)]
 use core::arch::asm;
-use libc::{c_int, c_long, sleep, syscall};
-use std::os::unix::io::{RawFd, AsRawFd};
+use libc::{c_int, c_long, syscall};
+use std::os::unix::io::{RawFd, AsRawFd, FromRawFd, IntoRawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::time::{Duration, Instant};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Mutex;
 use std::task::{Context, Poll, Waker};
 use tokio::sync::Notify;
+use tokio::sync::watch;
+use tokio::io::AsyncReadExt;
 
 static I: std::sync::Mutex<u32> = std::sync::Mutex::new(0);
 
@@ -79,27 +81,29 @@ pub extern "C" fn rust_interrupt_callback(handler_name: *const libc::c_char, vec
         match vector {
             SERVER_TOKEN => {
                 if SERVER_INITIALIZED {
-                    if let Some(ref token) = SERVER_TOKEN_OBJ {
-                        // println!("Interrupt callback: SERVER interrupt received");
-                        *token.inner.interrupt_received.lock().unwrap() = true;
-                        // 直接唤醒 waker
-                        if let Some(waker) = token.inner.waker.lock().unwrap().take() {
-                            // println!("Interrupt callback: SERVER waker woken");
-                            waker.wake();
-                        }
+                    // println!("Interrupt callback: SERVER interrupt received");
+                    // 记录事件
+                    if let Some(ref event_info) = SERVER_EVENT_INFO {
+                        event_info.pending.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    // 写入管道唤醒epoll
+                    if SERVER_PIPE_WRITE >= 0 {
+                        let buf = [1u8; 1];
+                        let _ = libc::write(SERVER_PIPE_WRITE, buf.as_ptr() as *const libc::c_void, 1);
                     }
                 }
             }
             CLIENT_TOKEN => {
                 if CLIENT_INITIALIZED {
-                    if let Some(ref token) = CLIENT_TOKEN_OBJ {
-                        // println!("Interrupt callback: CLIENT interrupt received");
-                        *token.inner.interrupt_received.lock().unwrap() = true;
-                        // 直接唤醒 waker
-                        if let Some(waker) = token.inner.waker.lock().unwrap().take() {
-                            // println!("Interrupt callback: CLIENT waker woken");
-                            waker.wake();
-                        }
+                    // println!("Interrupt callback: CLIENT interrupt received");
+                    // 记录事件
+                    if let Some(ref event_info) = CLIENT_EVENT_INFO {
+                        event_info.pending.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    // 写入管道唤醒epoll
+                    if CLIENT_PIPE_WRITE >= 0 {
+                        let buf = [1u8; 1];
+                        let _ = libc::write(CLIENT_PIPE_WRITE, buf.as_ptr() as *const libc::c_void, 1);
                     }
                 }
             }
@@ -196,6 +200,18 @@ fn uintr_register_sender(fd: RawFd, flags: c_int) -> Result<c_int, String> {
     }
 }
 
+fn uintr_wait(flags: c_int) -> Result<(), String> {
+    let result = unsafe { syscall(__NR_UINTR_WAIT, flags) as c_int };
+    if result < 0 {
+        Err(format!(
+            "uintr_wait failed: {}",
+            std::io::Error::last_os_error()
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 // 通过Unix Domain Socket发送文件描述符
 fn send_fd(socket: &UnixStream, fd: RawFd) -> Result<(), String> {
     unsafe {
@@ -277,7 +293,6 @@ fn recv_fd(socket: &UnixStream) -> Result<RawFd, String> {
         Ok(fd)
     }
 }
-
 // 定义向量/令牌常量
 const SERVER_TOKEN: u64 = 0;
 const CLIENT_TOKEN: u64 = 1;
@@ -290,59 +305,65 @@ static mut CLIENT_TOKEN_OBJ: Option<UintrToken> = None;
 static mut SERVER_INITIALIZED: bool = false;
 static mut CLIENT_INITIALIZED: bool = false;
 
-/// 表示某个 UINTR 中断源的句柄
-#[derive(Clone)]
-pub struct UintrToken {
-    inner: Arc<Inner>,
-    name: String,
+// 全局管道文件描述符（用于唤醒epoll）
+static mut SERVER_PIPE_READ: RawFd = -1;
+static mut SERVER_PIPE_WRITE: RawFd = -1;
+static mut CLIENT_PIPE_READ: RawFd = -1;
+static mut CLIENT_PIPE_WRITE: RawFd = -1;
+
+// 全局事件信息
+static mut SERVER_EVENT_INFO: Option<EventInfo> = None;
+static mut CLIENT_EVENT_INFO: Option<EventInfo> = None;
+
+#[derive(Debug)]
+struct EventInfo {
+    pending: AtomicBool,
+    tx: watch::Sender<u64>,
+    counter: AtomicU64,
 }
 
-struct Inner {
-    /// 中断是否已经到达
-    interrupt_received: Mutex<bool>,
-    /// 当前在等这个中断的任务的 waker（最多一个）
-    waker: Mutex<Option<Waker>>,
-}
-
-impl UintrToken {
-    pub fn new(name: &str) -> Self {
+impl Default for EventInfo {
+    fn default() -> Self {
+        let (tx, _rx) = watch::channel(0u64);
         Self {
-            inner: Arc::new(Inner {
-                interrupt_received: Mutex::new(false),
-                waker: Mutex::new(None),
-            }),
-            name: name.to_string(),
+            pending: AtomicBool::new(false),
+            tx,
+            counter: AtomicU64::new(0),
         }
     }
 }
 
-/// UINTR 异步 Future
-pub struct UintrFuture {
-    token: UintrToken,
+/// 表示某个 UINTR 中断源的句柄
+#[derive(Clone)]
+pub struct UintrToken {
+    pipe_read: RawFd,
+    name: String,
 }
 
-impl Future for UintrFuture {
-    type Output = std::io::Result<()>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // 检查是否有中断到达
-        let mut interrupt_received = self.token.inner.interrupt_received.lock().unwrap();
-        if *interrupt_received {
-            // println!("Poll {}: ready", self.token.name);
-            *interrupt_received = false;
-            Poll::Ready(Ok(()))
-        } else {
-            // 没有中断，保存 waker 并返回 Pending
-            *self.token.inner.waker.lock().unwrap() = Some(cx.waker().clone());
-            // println!("Poll {}: pending", self.token.name);
-            Poll::Pending
-        }
+impl UintrToken {
+    pub fn new(name: &str, pipe_read: RawFd) -> Self {
+        Self { pipe_read, name: name.to_string() }
     }
 }
 
 /// 异步等待 UINTR 中断
 pub async fn uintr(token: UintrToken) -> std::io::Result<()> {
-    UintrFuture { token }.await
+    let mut rx = unsafe {
+        if token.name == "SERVER" {
+            SERVER_EVENT_INFO.as_ref().unwrap().tx.subscribe()
+        } else {
+            CLIENT_EVENT_INFO.as_ref().unwrap().tx.subscribe()
+        }
+    };
+    
+    // 先读取当前值，这样changed()会等待下一个值
+    let _ = rx.borrow_and_update();
+    
+    // 等待下一个事件
+    let _ = rx.changed().await;
+    // 标记为已读取
+    let _ = rx.borrow_and_update();
+    Ok(())
 }
 
 // 全局状态 - 使用两个文件描述符
@@ -605,9 +626,19 @@ fn uintrfd_notify(uipi_index: c_int) {
 
 // 客户端设置
 async fn setup_client() {
+    // 创建管道用于唤醒epoll
+    let (pipe_read, pipe_write) = unsafe {
+        let mut fds = [0i32; 2];
+        libc::pipe(fds.as_mut_ptr());
+        (fds[0], fds[1])
+    };
+    
     // 初始化客户端 UintrToken
     unsafe {
-        CLIENT_TOKEN_OBJ = Some(UintrToken::new("CLIENT"));
+        CLIENT_EVENT_INFO = Some(EventInfo::default());
+        CLIENT_TOKEN_OBJ = Some(UintrToken::new("CLIENT", pipe_read));
+        CLIENT_PIPE_READ = pipe_read;
+        CLIENT_PIPE_WRITE = pipe_write;
         CLIENT_INITIALIZED = true;
     }
 
@@ -639,13 +670,51 @@ async fn setup_client() {
         stui();
     }
     println!("Client: Interrupts enabled");
+    
+    // 启动管道读取任务
+    tokio::spawn(async move {
+        let mut pipe_read = unsafe { tokio::fs::File::from_raw_fd(pipe_read) };
+        let mut buf = [0u8; 1024];
+        loop {
+            match pipe_read.read(&mut buf).await {
+                Ok(n) if n > 0 => {
+                    // 广播事件
+                    unsafe {
+                        if let Some(ref event_info) = CLIENT_EVENT_INFO {
+                            if event_info.pending.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                                let count = event_info.counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                                let _ = event_info.tx.send(count);
+                            }
+                        }
+                    }
+                }
+                Ok(_) => {
+                    // EOF，不应该发生
+                    break;
+                }
+                Err(_) => {
+                    // 错误，继续尝试
+                }
+            }
+        }
+    });
 }
 
 // 服务端设置
 async fn setup_server() {
+    // 创建管道用于唤醒epoll
+    let (pipe_read, pipe_write) = unsafe {
+        let mut fds = [0i32; 2];
+        libc::pipe(fds.as_mut_ptr());
+        (fds[0], fds[1])
+    };
+    
     // 初始化服务器 UintrToken
     unsafe {
-        SERVER_TOKEN_OBJ = Some(UintrToken::new("SERVER"));
+        SERVER_EVENT_INFO = Some(EventInfo::default());
+        SERVER_TOKEN_OBJ = Some(UintrToken::new("SERVER", pipe_read));
+        SERVER_PIPE_READ = pipe_read;
+        SERVER_PIPE_WRITE = pipe_write;
         SERVER_INITIALIZED = true;
     }
 
@@ -677,6 +746,34 @@ async fn setup_server() {
         stui();
     }
     println!("Server: Interrupts enabled");
+    
+    // 启动管道读取任务
+    tokio::spawn(async move {
+        let mut pipe_read = unsafe { tokio::fs::File::from_raw_fd(pipe_read) };
+        let mut buf = [0u8; 1024];
+        loop {
+            match pipe_read.read(&mut buf).await {
+                Ok(n) if n > 0 => {
+                    // 广播事件
+                    unsafe {
+                        if let Some(ref event_info) = SERVER_EVENT_INFO {
+                            if event_info.pending.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                                let count = event_info.counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                                let _ = event_info.tx.send(count);
+                            }
+                        }
+                    }
+                }
+                Ok(_) => {
+                    // EOF，不应该发生
+                    break;
+                }
+                Err(_) => {
+                    // 错误，继续尝试
+                }
+            }
+        }
+    });
 }
 
 // 客户端通信函数
@@ -984,9 +1081,9 @@ let rt = tokio::runtime::Builder::new_current_thread()
             loop {
                 // 做一点无害的运算，确保线程时刻在跑
                 // 实践来看 2000 次循环 效果最好
-                for _ in 0..1000 {
-                    std::hint::spin_loop();
-                }
+                // for _ in 0..1000 {
+                //     std::hint::spin_loop();
+                // }
                 // tokio::time::sleep(tokio::time::Duration::from_micros(200)).await;
                 // 可选：偶尔 yield 一下，避免饿死其他任务
                 tokio::task::yield_now().await;
@@ -1075,3 +1172,4 @@ let rt = tokio::runtime::Builder::new_current_thread()
         let _ = std::fs::remove_file("/tmp/client_uintr_info");
     });
 }
+
