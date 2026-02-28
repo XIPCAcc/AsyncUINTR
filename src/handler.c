@@ -2,6 +2,11 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <string.h>
+#include <sys/syscall.h>
+#include <stdbool.h>
+
+// 系统调用号
+#define __NR_uintr_wait 476
 
 // UINTR栈帧结构（必须与内核一致）
 struct UintrFrame {
@@ -70,4 +75,10 @@ void set_server_uintr_received(int value) {
 // 设置客户端中断标志
 void set_client_uintr_received(int value) {
     uintr_received[CLIENT_TOKEN] = value;
+}
+
+// uintr_wait 系统调用包装函数
+bool uintr_wait(int flags) {
+    long result = syscall(__NR_uintr_wait, flags);
+    return result == 0;
 }

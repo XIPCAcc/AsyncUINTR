@@ -44,6 +44,20 @@ use std::sync::Mutex;
 use std::task::{Context, Poll, Waker};
 use tokio::sync::Notify;
 
+// 系统调用号定义
+// uintr_wait系统调用实现
+pub fn uintr_wait(flags: c_int) -> Result<(), String> {
+    let result = unsafe {
+        syscall(__NR_UINTR_WAIT as c_long, flags as c_long)
+    };
+    
+    if result < 0 {
+        Err(format!("uintr_wait failed with error code: {}", result))
+    } else {
+        Ok(())
+    }
+}
+
 static I: std::sync::Mutex<u32> = std::sync::Mutex::new(0);
 
 // UINTR栈帧结构（必须与内核一致）
@@ -814,29 +828,29 @@ async fn client_communicate(
     println!("Client: Starting communication for {} messages", args.count);
 
     let mut message_count = 0;
-    
+    let uipi_index = get_client_uipi_index();
     while message_count < args.count && !test_done.load(std::sync::atomic::Ordering::Acquire) {
-        if message_count % 100 == 0 {
-            println!("Client: Progress - {} / {}", message_count, args.count);
-        }
+        // if message_count % 100 == 0 {
+        //     println!("Client: Progress - {} / {}", message_count, args.count);
+        // }
         
         // 等待来自服务端的中断
         if client_uintrfd_wait().await {
             // 发送响应中断
-            let uipi_index = get_client_uipi_index();
-            if uipi_index >= 0 {
-                if message_count % 100 == 0 {
-                    println!("Client: Sending response interrupt #{}", message_count);
-                }
-                uintrfd_notify(uipi_index);
-                unsafe {
-                    CLIENT_SENT_COUNT += 1;
-                }
-                message_count += 1;
-            } else {
-                println!("Error: Client UIPI index not set");
-                break;
-            }
+            uintrfd_notify(uipi_index);
+            // if uipi_index >= 0 {
+            //     if message_count % 100 == 0 {
+            //         println!("Client: Sending response interrupt #{}", message_count);
+            //     }
+                
+            //     unsafe {
+            //         CLIENT_SENT_COUNT += 1;
+            //     }
+            //     message_count += 1;
+            // } else {
+            //     println!("Error: Client UIPI index not set");
+            //     break;
+            // }
         }
     }
 
@@ -927,38 +941,27 @@ async fn server_communicate(
 
     // 重置总开始时间，确保从实际开始通信时计时
     bench.reset_total_start();
-
+    let uipi_index = get_server_uipi_index();
     for i in 0..args.count {
-        if i % 100 == 0 {
-            println!("Server: Progress - {} / {}", i, args.count);
-        }
+        // if i % 100 == 0 {
+        //     println!("Server: Progress - {} / {}", i, args.count);
+        // }
         
         // 开始测量单个操作
         bench.start_operation();
 
         // 发送中断到客户端
-        let uipi_index = get_server_uipi_index();
-        if uipi_index >= 0 {
-            uintrfd_notify(uipi_index);
-            unsafe {
-                SERVER_SENT_COUNT += 1;
-                if i % 100 == 0 {
-                    println!("Server: Sent interrupt #{}", i);
-                }
-            }
-        } else {
-            println!("Error: Server UIPI index not set");
-            break;
-        }
+        uintrfd_notify(uipi_index);
+        
+            // unsafe {
+            //     SERVER_SENT_COUNT += 1;
+            //     if i % 100 == 0 {
+            //         println!("Server: Sent interrupt #{}", i);
+            //     }
+            // }
 
         // 等待响应
-        let mut retry_count = 0;
-        while !server_uintrfd_wait().await {
-            retry_count += 1;
-            if retry_count > 100 {
-                break;
-            }
-        }
+        server_uintrfd_wait().await;
 
         // 结束测量单个操作并更新统计
         bench.end_operation();
@@ -1060,22 +1063,22 @@ let rt = tokio::runtime::Builder::new_current_thread()
         //         // println!("Wakeup worker thread");
         //     }
         // });
-        tokio::spawn(async {
-            // tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-            loop {
-                // 做一点无害的运算，确保线程时刻在跑
-                // 实践来看 2000 次循环 效果最好
-                for _ in 0..2000 {
-                    std::hint::spin_loop();
+        // tokio::spawn(async {
+        //     // tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+        //     loop {
+        //         // 做一点无害的运算，确保线程时刻在跑
+        //         // 实践来看 2000 次循环 效果最好
+        //         for _ in 0..2000 {
+        //             std::hint::spin_loop();
 
-                }
-                // 可选：偶尔 yield 一下，避免饿死其他任务
-                tokio::task::yield_now().await;
-                // let mut i = I.lock().unwrap();
-                // *i += 1;
-                // println!("Yield worker thread {}", *i);
-            }
-        });
+        //         }
+        //         // 可选：偶尔 yield 一下，避免饿死其他任务
+        //         tokio::task::yield_now().await;
+        //         // let mut i = I.lock().unwrap();
+        //         // *i += 1;
+        //         // println!("Yield worker thread {}", *i);
+        //     }
+        // });
         match args.mode {
             Mode::Server => {
                 println!("Running as server");
