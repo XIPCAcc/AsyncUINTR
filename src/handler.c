@@ -78,7 +78,7 @@ void set_client_uintr_received(int value) {
 }
 
 // uintr_wait 系统调用包装函数
-bool uintr_wait(int flags) {
-    long result = syscall(__NR_uintr_wait, flags);
+bool uintr_wait(long usec, int flags) {
+    long result = syscall(__NR_uintr_wait, usec, flags);
     return result == 0;
 }

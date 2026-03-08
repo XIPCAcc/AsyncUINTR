@@ -46,9 +46,9 @@ use tokio::sync::Notify;
 
 // 系统调用号定义
 // uintr_wait系统调用实现
-pub fn uintr_wait(flags: c_int) -> Result<(), String> {
+pub fn uintr_wait(usec: c_long, flags: c_int) -> Result<(), String> {
     let result = unsafe {
-        syscall(__NR_UINTR_WAIT as c_long, flags as c_long)
+        syscall(__NR_UINTR_WAIT as c_long, usec, flags as c_long)
     };
     
     if result < 0 {
@@ -75,6 +75,9 @@ const __NR_UINTR_CREATE_FD: c_long = 473;
 const __NR_UINTR_REGISTER_SENDER: c_long = 474;
 const __NR_UINTR_UNREGISTER_SENDER: c_long = 475;
 const __NR_UINTR_WAIT: c_long = 476;
+
+// UINTR handler flags
+const UINTR_HANDLER_FLAG_WAITING_ANY: c_int = 0x3000;
 
 // 声明C语言中断处理程序和辅助函数
 unsafe extern "C" {
@@ -408,10 +411,12 @@ impl Future for UintrFuture {
         let mut pending = self.token.inner.pending.lock().unwrap();
         if *pending {
             *pending = false;
+            println!("UINTR Future: Interrupt received for token {}", self.token.name);
             Poll::Ready(Ok(()))
         } else {
             // 没有 pending，保存 waker 并返回 Pending
             *self.token.inner.waker.lock().unwrap() = Some(cx.waker().clone());
+            println!("UINTR Future: Registered waker for token {}", self.token.name);
             Poll::Pending
         }
     }
@@ -645,9 +650,11 @@ async fn server_uintrfd_wait() -> bool {
     
     match uintr(token).await {
         Ok(()) => {
+            println!("Server: Interrupt received");
             true
         },
         Err(_) => {
+            println!("Server: Interrupt wait error");
             false
         },
     }
@@ -661,9 +668,11 @@ async fn client_uintrfd_wait() -> bool {
     
     match uintr(token).await {
         Ok(()) => {
+            println!("Client: Interrupt received");
             true
         },
         Err(_) => {
+            println!("Client: Interrupt wait error");
             false
         },
     }
@@ -689,7 +698,7 @@ async fn setup_client() {
     }
 
     // 注册客户端中断处理程序
-    match uintr_register_handler(client_ui_handler, 0) {
+    match uintr_register_handler(client_ui_handler, UINTR_HANDLER_FLAG_WAITING_ANY) {
         Ok(res) => {
             println!("Client: Interrupt handler registered successfully: {}", res);
         }
@@ -727,7 +736,7 @@ async fn setup_server() {
     }
 
     // 注册服务器中断处理程序
-    match uintr_register_handler(server_ui_handler, 0) {
+    match uintr_register_handler(server_ui_handler, UINTR_HANDLER_FLAG_WAITING_ANY) {
         Ok(res) => {
             println!("Server: Interrupt handler registered successfully: {}", res);
         }
@@ -835,23 +844,11 @@ async fn client_communicate(
         // }
         
         // 等待来自服务端的中断
-        if client_uintrfd_wait().await {
-            // 发送响应中断
-            uintrfd_notify(uipi_index);
-            // if uipi_index >= 0 {
-            //     if message_count % 100 == 0 {
-            //         println!("Client: Sending response interrupt #{}", message_count);
-            //     }
-                
-            //     unsafe {
-            //         CLIENT_SENT_COUNT += 1;
-            //     }
-            //     message_count += 1;
-            // } else {
-            //     println!("Error: Client UIPI index not set");
-            //     break;
-            // }
-        }
+        client_uintrfd_wait().await;
+        // 发送响应中断
+        uintrfd_notify(uipi_index);
+        // println!("Client: Sending response interrupt #{}", message_count);
+        message_count += 1;
     }
 
     println!("Client: Communication complete");
@@ -934,6 +931,11 @@ async fn server_communicate(
         panic!("Server: Timeout waiting for client connection");
     }
 
+    unsafe {
+        println!("Server: Waiting for 2 seconds before starting communication");
+        libc::sleep(2);
+    }
+
     // 设置基准测试
     let mut bench = Benchmarks::new();
 
@@ -943,23 +945,13 @@ async fn server_communicate(
     bench.reset_total_start();
     let uipi_index = get_server_uipi_index();
     for i in 0..args.count {
-        // if i % 100 == 0 {
-        //     println!("Server: Progress - {} / {}", i, args.count);
-        // }
-        
         // 开始测量单个操作
         bench.start_operation();
 
         // 发送中断到客户端
         uintrfd_notify(uipi_index);
         
-            // unsafe {
-            //     SERVER_SENT_COUNT += 1;
-            //     if i % 100 == 0 {
-            //         println!("Server: Sent interrupt #{}", i);
-            //     }
-            // }
-
+        println!("Server: Sent interrupt #{}", i);
         // 等待响应
         server_uintrfd_wait().await;
 
