@@ -52,8 +52,28 @@ pub fn uintr_wait(usec: c_long, flags: c_int) -> Result<(), String> {
     };
     
     if result < 0 {
-        Err(format!("uintr_wait failed with error code: {}", result))
+        let errno = unsafe { *libc::__errno_location() };
+        match errno {
+            libc::EINTR => {
+                // 正确：被用户态中断中断
+                Ok(())
+            },
+            libc::ENOSYS => {
+                Err("错误: CPU 或内核不支持 UINTR".to_string())
+            },
+            libc::EINVAL => {
+                Err("错误: 参数无效".to_string())
+            },
+            libc::EOPNOTSUPP => {
+                Err("错误: 进程未注册为 UINTR 接收者".to_string())
+            },
+            _ => {
+                Err(format!("uintr_wait failed with error code: {} (errno: {})
+", result, errno))
+            }
+        }
     } else {
+        // 返回0：超时，没有收到用户态中断
         Ok(())
     }
 }
@@ -112,6 +132,7 @@ pub extern "C" fn rust_interrupt_callback(handler_name: *const libc::c_char, vec
             }
             _ => {}
         }
+        println!("Received interrupt for vector: {}", vector);
     }
 }
 
@@ -411,12 +432,12 @@ impl Future for UintrFuture {
         let mut pending = self.token.inner.pending.lock().unwrap();
         if *pending {
             *pending = false;
-            println!("UINTR Future: Interrupt received for token {}", self.token.name);
+            // println!("UINTR Future: Interrupt received for token {}", self.token.name);
             Poll::Ready(Ok(()))
         } else {
             // 没有 pending，保存 waker 并返回 Pending
             *self.token.inner.waker.lock().unwrap() = Some(cx.waker().clone());
-            println!("UINTR Future: Registered waker for token {}", self.token.name);
+            // println!("UINTR Future: Registered waker for token {}", self.token.name);
             Poll::Pending
         }
     }
@@ -533,6 +554,8 @@ impl Benchmarks {
         self.sum += duration;
         self.squared_sum += nanos as f64 * nanos as f64;
         self.count += 1;
+        // 打印每次的duration
+        println!("time[{}]={} ns", self.count, nanos);
     }
 
     // 获取CPU时间（纳秒）
@@ -650,7 +673,7 @@ async fn server_uintrfd_wait() -> bool {
     
     match uintr(token).await {
         Ok(()) => {
-            println!("Server: Interrupt received");
+            // println!("Server: Interrupt received");
             true
         },
         Err(_) => {
@@ -847,7 +870,6 @@ async fn client_communicate(
         client_uintrfd_wait().await;
         // 发送响应中断
         uintrfd_notify(uipi_index);
-        // println!("Client: Sending response interrupt #{}", message_count);
         message_count += 1;
     }
 
@@ -949,10 +971,13 @@ async fn server_communicate(
         bench.start_operation();
 
         // 发送中断到客户端
+        println!("Server: Sending interrupt #{}", i);
+
         uintrfd_notify(uipi_index);
-        
-        println!("Server: Sent interrupt #{}", i);
+
+        // println!("Server: Sent interrupt #{}", i);
         // 等待响应
+        println!("Server: Waiting for interrupt on vector {}", uipi_index);
         server_uintrfd_wait().await;
 
         // 结束测量单个操作并更新统计
